@@ -29,7 +29,8 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - uses: android-actions/setup-android@v3
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - uses: gradle/actions/setup-gradle@v4
         with:
@@ -40,8 +41,7 @@ jobs:
         run: gradle assembleDebug --stacktrace
 
       - name: Rename APK
-        run: |
-          cp "$PROJ"/app/build/outputs/apk/debug/*.apk "$ZIPNAME.apk"
+        run: cp "$PROJ"/app/build/outputs/apk/debug/*.apk "$ZIPNAME.apk"
 
       - uses: actions/upload-artifact@v4
         with:
