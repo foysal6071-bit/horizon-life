@@ -1,56 +1,84 @@
-name: Build APK and Release
+name: Build Android APK
+
 on:
   push:
-    branches: [ main, master ]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  android:
     runs-on: ubuntu-latest
+    outputs:
+      found: ${{ steps.unzip.outputs.found }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Unzip project
+      - name: Unzip game source
+        id: unzip
         run: |
-          ZIP=$(ls *.zip | sort -V | tail -1)
+          ZIP=$(ls -t *.zip 2>/dev/null | head -n1 || true)
+          if [ -z "$ZIP" ]; then
+            echo "No zip in the repo - nothing to build"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           echo "Using $ZIP"
-          mkdir work
-          unzip -q "$ZIP" -d work
-          SETTINGS=$(find work -name settings.gradle.kts | head -1)
-          PROJ=$(dirname "$SETTINGS")
-          echo "PROJ=$PROJ" >> $GITHUB_ENV
-          echo "ZIPNAME=${ZIP%.zip}" >> $GITHUB_ENV
+          rm -rf work && mkdir work && unzip -q -o "$ZIP" -d work
+          SETTINGS=$(find work -name settings.gradle | head -n1)
+          if [ -z "$SETTINGS" ]; then echo "settings.gradle not found in $ZIP"; exit 1; fi
+          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+          echo "found=true" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
+        if: steps.unzip.outputs.found == 'true'
+        with: { distribution: temurin, java-version: 17 }
 
-      - name: Accept Android licenses
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - name: Prepare Android project
+        if: steps.unzip.outputs.found == 'true'
+        run: |
+          cd "$PROJECT_DIR"
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          ls
+
+      - name: Install NDK and CMake
+        if: steps.unzip.outputs.found == 'true'
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;26.1.10909125" "cmake;3.22.1" > /dev/null
 
       - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.7
+        if: steps.unzip.outputs.found == 'true'
+        with: { gradle-version: "8.7" }
 
-      - name: Build debug APK
-        working-directory: ${{ env.PROJ }}
-        run: gradle assembleDebug --stacktrace
+      - name: Build APK
+        if: steps.unzip.outputs.found == 'true'
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle assembleDebug --no-daemon
 
-      - name: Rename APK
-        run: cp "$PROJ"/app/build/outputs/apk/debug/*.apk "$ZIPNAME.apk"
+      - name: Collect APK
+        if: steps.unzip.outputs.found == 'true'
+        run: |
+          mkdir -p out
+          cp "$(find "$PROJECT_DIR" -path '*outputs/apk/debug/*.apk' | head -n1)" out/SunnyDriftCar.apk
 
       - uses: actions/upload-artifact@v4
+        if: steps.unzip.outputs.found == 'true'
         with:
-          name: HorizonLife-debug-apk
-          path: ${{ env.ZIPNAME }}.apk
+          name: SunnyDriftCar-apk
+          path: out/SunnyDriftCar.apk
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+  release:
+    needs: android
+    if: needs.android.outputs.found == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: SunnyDriftCar-apk
+      - uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ github.run_number }}
-          name: ${{ env.ZIPNAME }} (build ${{ github.run_number }})
-          files: ${{ env.ZIPNAME }}.apk
+          name: Sunny Drift v${{ github.run_number }}
+          files: SunnyDriftCar.apk
