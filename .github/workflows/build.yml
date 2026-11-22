@@ -1,0 +1,56 @@
+name: Build APK and Release
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unzip project
+        run: |
+          ZIP=$(ls *.zip | sort -V | tail -1)
+          echo "Using $ZIP"
+          mkdir work
+          unzip -q "$ZIP" -d work
+          SETTINGS=$(find work -name settings.gradle.kts | head -1)
+          PROJ=$(dirname "$SETTINGS")
+          echo "PROJ=$PROJ" >> $GITHUB_ENV
+          echo "ZIPNAME=${ZIP%.zip}" >> $GITHUB_ENV
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJ }}
+        run: gradle assembleDebug --stacktrace
+
+      - name: Rename APK
+        run: |
+          cp "$PROJ"/app/build/outputs/apk/debug/*.apk "$ZIPNAME.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HorizonLife-debug-apk
+          path: ${{ env.ZIPNAME }}.apk
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: ${{ env.ZIPNAME }} (build ${{ github.run_number }})
+          files: ${{ env.ZIPNAME }}.apk
