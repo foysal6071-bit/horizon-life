@@ -1,95 +1,161 @@
-name: Build & Release Android APK
+name: Build & Release APK from ZIP
 
+# রিপোর ROOT-এ SunnyDriftCar_vNN.zip পুশ করলেই চলবে (অথবা Actions ট্যাব থেকে Run workflow)।
 on:
   push:
-    branches: [ main ]
+    paths: ['*.zip', '.github/workflows/release.yml']
   workflow_dispatch:
+    inputs:
+      zip_name:
+        description: 'কোন zip বিল্ড হবে (খালি রাখলে সবচেয়ে নতুন ভার্সন)'
+        required: false
+        default: ''
 
 permissions:
-  contents: write            # needed to create the Release
+  contents: write   # Release তৈরির জন্য
 
-env:
-  UNITY_VERSION: 2022.3.50f1
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      # 0) stop early with a clear message if the Unity license secrets are missing
-      - name: Check Unity secrets
-        env:
-          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
-          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
-          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
-        run: |
-          for v in UNITY_LICENSE UNITY_EMAIL UNITY_PASSWORD; do
-            if [ -z "${!v}" ]; then echo "::error::Secret $v is missing. Repo > Settings > Secrets and variables > Actions"; exit 1; fi
-          done
-
       - uses: actions/checkout@v4
 
-      # 1) unzip the project and add the files a bare "Assets only" zip is missing
-      - name: Unzip and prepare Unity project
+      - name: Pick ZIP
+        id: pick
         run: |
-          ZIP=$(ls -1 *.zip | head -n1)
-          echo "Using: $ZIP"
-          mkdir -p unity
-          unzip -q -o "$ZIP" -d unity
-          test -d unity/Assets || { echo "::error::Assets folder not found in zip"; exit 1; }
-          mkdir -p unity/ProjectSettings unity/Packages
-          echo "m_EditorVersion: $UNITY_VERSION" > unity/ProjectSettings/ProjectVersion.txt
-          cat > unity/Packages/manifest.json <<'JSON'
-          {
-            "dependencies": {
-              "com.unity.render-pipelines.universal": "14.0.11",
-              "com.unity.modules.androidjni": "1.0.0",
-              "com.unity.modules.animation": "1.0.0",
-              "com.unity.modules.audio": "1.0.0",
-              "com.unity.modules.imageconversion": "1.0.0",
-              "com.unity.modules.imgui": "1.0.0",
-              "com.unity.modules.jsonserialize": "1.0.0",
-              "com.unity.modules.physics": "1.0.0",
-              "com.unity.modules.ui": "1.0.0"
-            }
-          }
-          JSON
+          set -euo pipefail
+          Z="${{ github.event.inputs.zip_name }}"
+          if [ -z "$Z" ]; then Z=$(ls -1 *.zip 2>/dev/null | sort -V | tail -n1 || true); fi
+          [ -n "$Z" ] && [ -f "$Z" ] || { echo "::error::রিপোর root-এ কোনো .zip পাওয়া যায়নি"; exit 1; }
+          TAG=$(basename "$Z" .zip | sed 's/[^A-Za-z0-9._-]/_/g')
+          echo "zip=$Z" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Building: $Z  (tag: $TAG)"
 
-      - name: Free disk space
+      - name: Unzip
+        id: unzip
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
+          set -euo pipefail
+          rm -rf _src && mkdir _src
+          unzip -q "${{ steps.pick.outputs.zip }}" -d _src
+          # zip-এর ভেতরে settings.gradle যেখানে আছে সেটাই প্রজেক্ট root
+          S=$(find _src -maxdepth 3 -name 'settings.gradle*' -not -path '*/node_modules/*' | head -n1)
+          [ -n "$S" ] || { echo "::error::settings.gradle পাওয়া যায়নি"; exit 1; }
+          echo "dir=$(dirname "$S")" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/cache@v4
-        with:
-          path: unity/Library
-          key: Library-Android-${{ hashFiles('*.zip') }}
-          restore-keys: Library-Android-
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
 
-      # 2) build the APK (CiBuild.Build creates URP asset + scene, applies settings)
-      - uses: game-ci/unity-builder@v4
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: "8.7" }
+
+      - name: Prepare signing key
+        id: ks
         env:
-          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
-          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
-          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
-        with:
-          projectPath: unity
-          unityVersion: ${{ env.UNITY_VERSION }}
-          targetPlatform: Android
-          androidExportType: androidPackage
-          buildMethod: CiBuild.Build
-          buildName: SunnyDriftCar
-          versioning: None
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KS_KEYPASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KS="$RUNNER_TEMP/release.jks"
+          if [ -n "${KS_B64:-}" ]; then
+            echo "$KS_B64" | base64 -d > "$KS"
+            P="$KS_PASS"; A="$KS_ALIAS"; KP="${KS_KEYPASS:-$KS_PASS}"
+          else
+            echo "::warning::KEYSTORE_BASE64 secret নেই — প্রতিবার নতুন temporary key দিয়ে সাইন হচ্ছে (আগের ভার্সনের ওপর update-install হবে না)।"
+            P="android-ci-pass"; A="release"; KP="$P"
+            keytool -genkeypair -v -keystore "$KS" -storepass "$P" -keypass "$KP" \
+              -alias "$A" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=SunnyDriftCar"
+          fi
+          echo "::add-mask::$P"; echo "::add-mask::$KP"
+          {
+            echo "KS_FILE=$KS"; echo "KS_PASS=$P"; echo "KS_ALIAS=$A"; echo "KS_KEYPASS=$KP"
+          } >> "$GITHUB_ENV"
+
+      - name: Patch project for optimized release
+        working-directory: ${{ steps.unzip.outputs.dir }}
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+          TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          p = 'app/build.gradle'
+          s = open(p, encoding='utf-8').read()
+          if 'buildTypes' not in s:
+              block = """
+              signingConfigs {
+                  release {
+                      storeFile file(System.getenv('KS_FILE'))
+                      storePassword System.getenv('KS_PASS')
+                      keyAlias System.getenv('KS_ALIAS')
+                      keyPassword System.getenv('KS_KEYPASS')
+                  }
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled true
+                      shrinkResources true
+                      debuggable false
+                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'ci-rules.pro'
+                      signingConfig signingConfigs.release
+                      ndk { debugSymbolLevel 'NONE' }
+                  }
+              }
+          """
+              s, n = re.subn(r'(\bandroid\s*\{)', lambda m: m.group(1) + block, s, count=1)
+              assert n == 1, 'android { } block পাওয়া যায়নি'
+          # version bump: versionCode = CI run number, versionName = zip নাম
+          s = re.sub(r'versionCode\s+\d+', 'versionCode ' + os.environ['RUN_NUMBER'], s)
+          s = re.sub(r"versionName\s+['\"][^'\"]*['\"]", "versionName '" + os.environ['TAG'] + "'", s)
+          open(p, 'w', encoding='utf-8').write(s)
+          open('app/ci-rules.pro', 'w').write(
+              "-keepclasseswithmembernames class * { native <methods>; }\n"
+              "-keep class com.sunny.car.MainActivity { *; }\n")
+          PY
+
+      - name: Build release APK
+        working-directory: ${{ steps.unzip.outputs.dir }}
+        run: gradle assembleRelease -x lintVitalRelease --no-daemon --stacktrace
+
+      - name: Verify & name the APK
+        id: apk
+        working-directory: ${{ steps.unzip.outputs.dir }}
+        run: |
+          set -euo pipefail
+          SRC=$(ls app/build/outputs/apk/release/*.apk | head -n1)
+          OUT="$GITHUB_WORKSPACE/${{ steps.pick.outputs.tag }}-release.apk"
+          cp "$SRC" "$OUT"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
+          "$BT/apksigner" verify --verbose "$OUT" | head -n5
+          (cd "$GITHUB_WORKSPACE" && sha256sum "$(basename "$OUT")" > "$(basename "$OUT").sha256")
+          ls -lh "$OUT"
+          echo "file=$OUT" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: SunnyDriftCar-Android
-          path: build/Android/*.apk
+          name: ${{ steps.pick.outputs.tag }}-apk
+          path: |
+            ${{ steps.apk.outputs.file }}
+            ${{ steps.apk.outputs.file }}.sha256
 
-      # 3) publish a GitHub Release with the APK attached
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: Sunny Drift Car v1.0.${{ github.run_number }}
-          files: build/Android/*.apk
-          generate_release_notes: true
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.pick.outputs.tag }}
+          APK: ${{ steps.apk.outputs.file }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" "$APK.sha256" --clobber
+          else
+            gh release create "$TAG" "$APK" "$APK.sha256" \
+              --target "$GITHUB_SHA" --title "Sunny Drift Car $TAG" \
+              --notes "Optimized release APK (R8 minify + resource shrink, -O3 native, arm64-v8a + armeabi-v7a). Built from \`${{ steps.pick.outputs.zip }}\`."
+          fi
