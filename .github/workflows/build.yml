@@ -1,84 +1,84 @@
-name: Build Android APK
+name: Build & Release Android APK
 
 on:
   push:
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write            # needed to create the Release
+
+env:
+  UNITY_VERSION: 2022.3.50f1 # change if you want another 2022.3 LTS version
 
 jobs:
-  android:
+  build:
     runs-on: ubuntu-latest
-    outputs:
-      found: ${{ steps.unzip.outputs.found }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Unzip game source
-        id: unzip
+      # 1) unzip the project and add the files a bare "Assets only" zip is missing
+      - name: Unzip and prepare Unity project
         run: |
-          ZIP=$(ls -t *.zip 2>/dev/null | head -n1 || true)
-          if [ -z "$ZIP" ]; then
-            echo "No zip in the repo - nothing to build"
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          ZIP=$(ls *.zip | head -n1)
           echo "Using $ZIP"
-          rm -rf work && mkdir work && unzip -q -o "$ZIP" -d work
-          SETTINGS=$(find work -name settings.gradle | head -n1)
-          if [ -z "$SETTINGS" ]; then echo "settings.gradle not found in $ZIP"; exit 1; fi
-          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
-          echo "found=true" >> "$GITHUB_OUTPUT"
+          mkdir -p unity
+          unzip -q -o "$ZIP" -d unity
+          test -d unity/Assets || { echo "Assets folder not found in zip"; exit 1; }
+          mkdir -p unity/ProjectSettings unity/Packages
+          echo "m_EditorVersion: $UNITY_VERSION" > unity/ProjectSettings/ProjectVersion.txt
+          cat > unity/Packages/manifest.json <<'JSON'
+          {
+            "dependencies": {
+              "com.unity.render-pipelines.universal": "14.0.11",
+              "com.unity.modules.androidjni": "1.0.0",
+              "com.unity.modules.animation": "1.0.0",
+              "com.unity.modules.audio": "1.0.0",
+              "com.unity.modules.imageconversion": "1.0.0",
+              "com.unity.modules.imgui": "1.0.0",
+              "com.unity.modules.jsonserialize": "1.0.0",
+              "com.unity.modules.physics": "1.0.0",
+              "com.unity.modules.ui": "1.0.0"
+            }
+          }
+          JSON
 
-      - uses: actions/setup-java@v4
-        if: steps.unzip.outputs.found == 'true'
-        with: { distribution: temurin, java-version: 17 }
-
-      - name: Prepare Android project
-        if: steps.unzip.outputs.found == 'true'
+      - name: Free disk space
         run: |
-          cd "$PROJECT_DIR"
-          echo "sdk.dir=$ANDROID_HOME" > local.properties
-          ls
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
-      - name: Install NDK and CMake
-        if: steps.unzip.outputs.found == 'true'
-        run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;26.1.10909125" "cmake;3.22.1" > /dev/null
+      - uses: actions/cache@v4
+        with:
+          path: unity/Library
+          key: Library-Android-${{ hashFiles('SunnyDriftCar_Unity_URP.zip', '*.zip') }}
+          restore-keys: Library-Android-
 
-      - uses: gradle/actions/setup-gradle@v4
-        if: steps.unzip.outputs.found == 'true'
-        with: { gradle-version: "8.7" }
-
-      - name: Build APK
-        if: steps.unzip.outputs.found == 'true'
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: gradle assembleDebug --no-daemon
-
-      - name: Collect APK
-        if: steps.unzip.outputs.found == 'true'
-        run: |
-          mkdir -p out
-          cp "$(find "$PROJECT_DIR" -path '*outputs/apk/debug/*.apk' | head -n1)" out/SunnyDriftCar.apk
+      # 2) build the APK (CiBuild.Build creates URP asset + scene, applies settings)
+      - uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: unity
+          unityVersion: ${{ env.UNITY_VERSION }}
+          targetPlatform: Android
+          androidExportType: androidPackage
+          buildMethod: CiBuild.Build
+          buildName: SunnyDriftCar
+          versioning: None
 
       - uses: actions/upload-artifact@v4
-        if: steps.unzip.outputs.found == 'true'
         with:
-          name: SunnyDriftCar-apk
-          path: out/SunnyDriftCar.apk
+          name: SunnyDriftCar-Android
+          path: build/Android/*.apk
 
-  release:
-    needs: android
-    if: needs.android.outputs.found == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
+      # 3) publish a GitHub Release with the APK attached
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: SunnyDriftCar-apk
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ github.run_number }}
-          name: Sunny Drift v${{ github.run_number }}
-          files: SunnyDriftCar.apk
+          tag_name: v1.0.${{ github.run_number }}
+          name: Sunny Drift Car v1.0.${{ github.run_number }}
+          files: build/Android/*.apk
+          generate_release_notes: true
