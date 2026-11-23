@@ -9,22 +9,33 @@ permissions:
   contents: write            # needed to create the Release
 
 env:
-  UNITY_VERSION: 2022.3.50f1 # change if you want another 2022.3 LTS version
+  UNITY_VERSION: 2022.3.50f1
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # 0) stop early with a clear message if the Unity license secrets are missing
+      - name: Check Unity secrets
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        run: |
+          for v in UNITY_LICENSE UNITY_EMAIL UNITY_PASSWORD; do
+            if [ -z "${!v}" ]; then echo "::error::Secret $v is missing. Repo > Settings > Secrets and variables > Actions"; exit 1; fi
+          done
+
       - uses: actions/checkout@v4
 
       # 1) unzip the project and add the files a bare "Assets only" zip is missing
       - name: Unzip and prepare Unity project
         run: |
-          ZIP=$(ls *.zip | head -n1)
-          echo "Using $ZIP"
+          ZIP=$(ls -1 *.zip | head -n1)
+          echo "Using: $ZIP"
           mkdir -p unity
           unzip -q -o "$ZIP" -d unity
-          test -d unity/Assets || { echo "Assets folder not found in zip"; exit 1; }
+          test -d unity/Assets || { echo "::error::Assets folder not found in zip"; exit 1; }
           mkdir -p unity/ProjectSettings unity/Packages
           echo "m_EditorVersion: $UNITY_VERSION" > unity/ProjectSettings/ProjectVersion.txt
           cat > unity/Packages/manifest.json <<'JSON'
@@ -51,7 +62,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: unity/Library
-          key: Library-Android-${{ hashFiles('SunnyDriftCar_Unity_URP.zip', '*.zip') }}
+          key: Library-Android-${{ hashFiles('*.zip') }}
           restore-keys: Library-Android-
 
       # 2) build the APK (CiBuild.Build creates URP asset + scene, applies settings)
